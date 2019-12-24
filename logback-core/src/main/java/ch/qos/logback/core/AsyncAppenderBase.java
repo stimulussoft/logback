@@ -1,25 +1,14 @@
-/**
- * Logback: the reliable, generic, fast and flexible logging framework.
- * Copyright (C) 1999-2015, QOS.ch. All rights reserved.
- *
- * This program and the accompanying materials are dual-licensed under
- * either the terms of the Eclipse Public License v1.0 as published by
- * the Eclipse Foundation
- *
- *   or (per the licensee's choosing)
- *
- * under the terms of the GNU Lesser General Public License version 2.1
- * as published by the Free Software Foundation.
- */
 package ch.qos.logback.core;
 
 import ch.qos.logback.core.spi.AppenderAttachable;
 import ch.qos.logback.core.spi.AppenderAttachableImpl;
-import ch.qos.logback.core.util.InterruptUtil;
-
+import java.util.AbstractMap;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * This appender and derived classes, log events asynchronously.  In order to avoid loss of logging events, this
@@ -32,6 +21,8 @@ import java.util.concurrent.BlockingQueue;
  * <p>Please refer to the <a href="http://logback.qos.ch/manual/appenders.html#AsyncAppender">logback manual</a> for
  * further information about this appender.</p>
  *
+ * Modified to have one thread
+ *
  * @param <E>
  * @author Ceki G&uuml;lc&uuml;
  * @author Torsten Juergeleit
@@ -40,12 +31,56 @@ import java.util.concurrent.BlockingQueue;
 public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implements AppenderAttachable<E> {
 
     AppenderAttachableImpl<E> aai = new AppenderAttachableImpl<E>();
-    BlockingQueue<E> blockingQueue;
+
+    private static final ExecutorService pool = Executors.newSingleThreadExecutor(r -> {
+        Thread t = Executors.defaultThreadFactory().newThread(r);
+        t.setDaemon(true);
+        t.setName("logback async");
+        return t;
+    });
+
+    static {
+        pool.submit(new Worker());
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> pool.shutdownNow()));
+    }
+
+    static class Worker extends Thread {
+
+        public void run() {
+
+            // loop while the parent is started
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Map.Entry<Object,AsyncAppenderBase> e = blockingQueue.take();
+                    AsyncAppenderBase base = e.getValue();
+                    base.aai.appendLoopOnAppenders(e.getKey());
+                } catch (InterruptedException ie) {
+                    break;
+
+                }
+            }
+
+            //addInfo("Worker thread will flush remaining events before exiting. ");
+
+            for (Map.Entry<Object,AsyncAppenderBase> entry : blockingQueue) {
+                entry.getValue().aai.appendLoopOnAppenders(entry.getKey());
+                entry.getValue().blockingQueue.remove(entry.getKey());
+                entry.getValue().aai.detachAndStopAllAppenders();
+            }
+
+
+        }
+    }
+
 
     /**
      * The default buffer size.
      */
-    public static final int DEFAULT_QUEUE_SIZE = 256;
+
+    public static final int DEFAULT_QUEUE_SIZE = 2560;
+
+    private static BlockingQueue<Map.Entry<Object,AsyncAppenderBase>> blockingQueue = new ArrayBlockingQueue<>(DEFAULT_QUEUE_SIZE);
+
     int queueSize = DEFAULT_QUEUE_SIZE;
 
     int appenderCount = 0;
@@ -54,11 +89,9 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
     int discardingThreshold = UNDEFINED;
     boolean neverBlock = false;
 
-    Worker worker = new Worker();
-
     /**
-     * The default maximum queue flush time allowed during appender stop. If the 
-     * worker takes longer than this time it will exit, discarding any remaining 
+     * The default maximum queue flush time allowed during appender stop. If the
+     * worker takes longer than this time it will exit, discarding any remaining
      * items in the queue
      */
     public static final int DEFAULT_MAX_FLUSH_TIME = 1000;
@@ -99,16 +132,12 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
             addError("Invalid queue size [" + queueSize + "]");
             return;
         }
-        blockingQueue = new ArrayBlockingQueue<E>(queueSize);
 
         if (discardingThreshold == UNDEFINED)
             discardingThreshold = queueSize / 5;
         addInfo("Setting discardingThreshold to " + discardingThreshold);
-        worker.setDaemon(true);
-        worker.setName("AsyncAppender-Worker-" + getName());
         // make sure this instance is marked as "started" before staring the worker Thread
         super.start();
-        worker.start();
     }
 
     @Override
@@ -120,36 +149,7 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
         // aii.appendLoopOnAppenders
         // and sub-appenders consume the interruption
         super.stop();
-
-        // interrupt the worker thread so that it can terminate. Note that the interruption can be consumed
-        // by sub-appenders
-        worker.interrupt();
-
-        InterruptUtil interruptUtil = new InterruptUtil(context);
-
-        try {
-            interruptUtil.maskInterruptFlag();
-
-            worker.join(maxFlushTime);
-
-            // check to see if the thread ended and if not add a warning message
-            if (worker.isAlive()) {
-                addWarn("Max queue flush timeout (" + maxFlushTime + " ms) exceeded. Approximately " + blockingQueue.size()
-                                + " queued events were possibly discarded.");
-            } else {
-                addInfo("Queue flush finished successfully within timeout.");
-            }
-
-        } catch (InterruptedException e) {
-            int remaining = blockingQueue.size();
-            addError("Failed to join worker thread. " + remaining + " queued events may be discarded.", e);
-        } finally {
-            interruptUtil.unmaskInterruptFlag();
-        }
     }
-
-
-
 
 
     @Override
@@ -167,7 +167,7 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
 
     private void put(E eventObject) {
         if (neverBlock) {
-            blockingQueue.offer(eventObject);
+            blockingQueue.offer(new AbstractMap.SimpleEntry(eventObject, this));
         } else {
             putUninterruptibly(eventObject);
         }
@@ -178,7 +178,8 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
         try {
             while (true) {
                 try {
-                    blockingQueue.put(eventObject);
+
+                    blockingQueue.put(new AbstractMap.SimpleEntry(eventObject, this));
                     break;
                 } catch (InterruptedException e) {
                     interrupted = true;
@@ -277,30 +278,4 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
         return aai.detachAppender(name);
     }
 
-    class Worker extends Thread {
-
-        public void run() {
-            AsyncAppenderBase<E> parent = AsyncAppenderBase.this;
-            AppenderAttachableImpl<E> aai = parent.aai;
-
-            // loop while the parent is started
-            while (parent.isStarted()) {
-                try {
-                    E e = parent.blockingQueue.take();
-                    aai.appendLoopOnAppenders(e);
-                } catch (InterruptedException ie) {
-                    break;
-                }
-            }
-
-            addInfo("Worker thread will flush remaining events before exiting. ");
-
-            for (E e : parent.blockingQueue) {
-                aai.appendLoopOnAppenders(e);
-                parent.blockingQueue.remove(e);
-            }
-
-            aai.detachAndStopAllAppenders();
-        }
-    }
 }
