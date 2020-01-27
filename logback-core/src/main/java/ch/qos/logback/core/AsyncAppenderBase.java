@@ -5,11 +5,10 @@ import ch.qos.logback.core.spi.AppenderAttachableImpl;
 import java.util.AbstractMap;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-
+import com.conversantmedia.util.concurrent.*;
 /**
  * This appender and derived classes, log events asynchronously.  In order to avoid loss of logging events, this
  * appender should be closed. It is the user's  responsibility to close appenders, typically at the end of the
@@ -31,6 +30,8 @@ import java.util.concurrent.Executors;
 public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implements AppenderAttachable<E> {
 
     AppenderAttachableImpl<E> aai = new AppenderAttachableImpl<E>();
+
+    /* For multitenant apps, we want to use a shared worker pool across multiple async appenders */
 
     private static final ExecutorService pool = Executors.newSingleThreadExecutor(r -> {
         Thread t = Executors.defaultThreadFactory().newThread(r);
@@ -79,7 +80,7 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
 
     public static final int DEFAULT_QUEUE_SIZE = 2560;
 
-    private static BlockingQueue<Map.Entry<Object,AsyncAppenderBase>> blockingQueue = new ArrayBlockingQueue<>(DEFAULT_QUEUE_SIZE);
+    private static BlockingQueue<Map.Entry<Object,AsyncAppenderBase>> blockingQueue = new DisruptorBlockingQueue<>(DEFAULT_QUEUE_SIZE, SpinPolicy.BLOCKING);
 
     int queueSize = DEFAULT_QUEUE_SIZE;
 
@@ -144,6 +145,8 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
     public void stop() {
         if (!isStarted())
             return;
+
+        aai.detachAndStopAllAppenders();
 
         // mark this appender as stopped so that Worker can also processPriorToRemoval if it is invoking
         // aii.appendLoopOnAppenders

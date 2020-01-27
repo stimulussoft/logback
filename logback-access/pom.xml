@@ -8,7 +8,7 @@
   <parent>
     <groupId>ch.qos.logback</groupId>
     <artifactId>logback-parent</artifactId>
-    <version>1.2.3b</version>
+    <version>1.2.3d</version>
   </parent>
 
   <artifactId>logback-access</artifactId>
@@ -25,6 +25,7 @@
     <dependency>
       <groupId>ch.qos.logback</groupId>
       <artifactId>logback-core</artifactId>
+      <version>1.2.3</version>
       <type>test-jar</type>
       <scope>test</scope>
     </dependency>
